@@ -53,6 +53,7 @@ A production-ready HTTP load balancer written in Go with advanced features inclu
 - **Thread-Safe Operations**: Uses mutexes and atomic operations for concurrency
 - **Session Management**: Cookie-based sticky session implementation
 - **Weighted Routing**: Configurable weights for backend server prioritization
+- **Rate Limiting**: Token bucket limiter with warmup to handle bursts safely
 - **Graceful Error Handling**: Proper error handling throughout the application
 - **Configurable Timeouts**: Health check timeouts and autoscaling intervals
 - **Production Ready**: Structured logging and monitoring capabilities
@@ -124,8 +125,8 @@ You can modify these values in `main.go`:
 
 ### Prometheus Metrics
 - `loadbalancer_requests_total{backend, status}` - Request counters
-- `loadbalancer_backend_connections{backend}` - Active connections
-- `loadbalancer_request_duration_seconds{backend}` - Response times
+- `loadbalancer_z_backend_connections{backend}` - Active connections
+- `loadbalancer_z_request_duration_seconds{backend}` - Response times
 
 ### Grafana Integration
 Ready-to-use dashboard queries for comprehensive monitoring and alerting.
@@ -318,12 +319,11 @@ This project demonstrates:
    ```
    Returns JSON with backend health status and weights.
 
-4. **Generate load to trigger autoscaling**
+4. **Run comprehensive test suite**
    ```bash
-   for i in {1..25}; do
-     curl -s http://localhost:8080/lb &
-   done
+   bash tester.sh
    ```
+   Executes end-to-end checks covering health, routing, metrics, Prometheus, rate limiting, and load generation.
    Watch the logs for autoscaling messages when request count exceeds threshold.
 
 ## Configuration
