@@ -71,7 +71,7 @@ jobs:
       id: meta
       uses: docker/metadata-action@v4
       with:
-        images: docker.io/tusharxo/load-balancer-go
+        images: docker.io/tusharxoxd/load-balancer-go
         tags: |
           type=ref,event=branch
           type=ref,event=pr
