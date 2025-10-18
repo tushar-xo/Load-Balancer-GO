@@ -238,10 +238,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// prometheusHandler serves Prometheus metrics
-func prometheusHandler(w http.ResponseWriter, r *http.Request) {
-	promhttp.Handler().ServeHTTP(w, r)
-}
+
 
 // main is the entry point of the load balancer application
 func main() {
@@ -299,13 +296,15 @@ func main() {
 	log.Printf("[INFO]   - Metrics: http://localhost:8080/metrics")
 	log.Printf("[INFO]   - Health: http://localhost:8080/health")
 	log.Printf("[INFO]   - Prometheus: http://localhost:8080/prometheus")
-
+	
 	// Start background services
 	go loadbalancer.HealthCheckLoop(&serverPool)
 	go loadbalancer.AutoScalerLoop(&requestCount, &serverPool)
 
 	log.Printf("[INFO] Load balancer is ready to accept connections")
+	
+	// Start the HTTP server with default ServeMux
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("[ERROR] Load balancer failed to start: %v", err)
+		log.Fatalf("[ERROR] Failed to start server: %v", err)
 	}
 }
