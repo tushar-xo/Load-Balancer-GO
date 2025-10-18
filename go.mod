@@ -1,4 +1,4 @@
-module go-loadbalancer
+module github.com/tushar-xo/Load-Balancer-GO
 
 go 1.23.0
 

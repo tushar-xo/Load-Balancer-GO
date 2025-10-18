@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go-loadbalancer/loadbalancer" // Import our loadbalancer package
+	"github.com/tushar-xo/Load-Balancer-GO/loadbalancer" // Import our loadbalancer package
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
