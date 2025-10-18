@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"net/url"
 	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,13 +20,52 @@ import (
 )
 
 // Global variables for load balancer state management
-var requestCount int64          // Counter for total requests processed
-var serverPool = ServerPool{     // Initialize ServerPool with sticky sessions map
+var requestCount int64       // Counter for total requests processed
+var serverPool = ServerPool{ // Initialize ServerPool with sticky sessions map
 	stickySessions: make(map[string]*Backend),
+}
+
+func getClientRegion(r *http.Request) string {
+	if region := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Client-Region"))); region != "" {
+		return region
+	}
+	if region := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Geo-Region"))); region != "" {
+		return region
+	}
+	if region := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("region"))); region != "" {
+		return region
+	}
+	ip := clientIPFromRequest(r)
+	if ip == "" {
+		return "default"
+	}
+	if strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "192.168.") {
+		return "us-east"
+	}
+	if strings.HasPrefix(ip, "172.") {
+		return "us-west"
+	}
+	return "default"
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // Prometheus metrics
 var (
+	promRegistry = prometheus.NewRegistry()
+
 	requestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "loadbalancer_requests_total",
@@ -35,7 +76,7 @@ var (
 
 	backendConnections = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "loadbalancer_backend_connections",
+			Name: "loadbalancer_z_backend_connections",
 			Help: "Number of active connections to each backend",
 		},
 		[]string{"backend"},
@@ -43,7 +84,7 @@ var (
 
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "loadbalancer_request_duration_seconds",
+			Name: "loadbalancer_z_request_duration_seconds",
 			Help: "Request duration in seconds",
 		},
 		[]string{"backend"},
@@ -51,11 +92,20 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(requestsTotal)
-	prometheus.MustRegister(backendConnections)
-	prometheus.MustRegister(requestDuration)
+	promRegistry.MustRegister(requestsTotal)
+	promRegistry.MustRegister(backendConnections)
+	promRegistry.MustRegister(requestDuration)
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
 
 // lbHandler handles load balancing requests with support for weighted routing and sticky sessions
 // It checks for sticky session cookies and routes accordingly
@@ -81,11 +131,15 @@ func lbHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get backend based on sticky session or load balancing algorithm
 	var peer *Backend
+	region := getClientRegion(r)
 	if sessionID != "" {
-		peer = serverPool.GetBackendForStickySession(sessionID)
+		peer = serverPool.GetBackendForStickySession(sessionID, region)
 	} else {
 		// Use weighted routing for new sessions
-		peer = serverPool.GetNextPeerWeighted()
+		peer = serverPool.SelectBackend(region)
+		if peer == nil {
+			peer = serverPool.GetNextPeerWeighted()
+		}
 	}
 
 	if peer == nil {
@@ -97,7 +151,24 @@ func lbHandler(w http.ResponseWriter, r *http.Request) {
 	// Log the routing decision
 	log.Printf("[INFO] Routing request to backend: %s (session: %s)", peer.URL.String(), sessionID)
 
-	peer.ReverseProxy.ServeHTTP(w, r)
+	peer.IncrementActive()
+	defer func() {
+		peer.DecrementActive()
+		backendConnections.WithLabelValues(peer.URL.String()).Set(float64(peer.ActiveConnections()))
+	}()
+
+	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	start := time.Now()
+	peer.ReverseProxy.ServeHTTP(recorder, r)
+	duration := time.Since(start)
+	statusCode := recorder.status
+	if statusCode == 0 {
+		statusCode = http.StatusBadGateway
+	}
+	success := statusCode < 500
+	peer.RecordMetrics(duration, success)
+	requestsTotal.WithLabelValues(peer.URL.String(), strconv.Itoa(statusCode)).Inc()
+	requestDuration.WithLabelValues(peer.URL.String()).Observe(duration.Seconds())
 }
 
 // dashboardHandler serves a web dashboard showing load balancer status and metrics
@@ -150,17 +221,18 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         <div class="backend-grid">`
 
 	totalRequests := atomic.LoadInt64(&requestCount)
-	activeBackends := len(serverPool.backends)
+	backends := serverPool.Backends()
+	activeBackends := len(backends)
 	healthyBackends := 0
 
-	for _, backend := range serverPool.backends {
+	for _, backend := range backends {
 		if backend.IsAlive() {
 			healthyBackends++
 		}
 	}
 
 	// Generate backend cards
-	for _, backend := range serverPool.backends {
+	for _, backend := range backends {
 		status := "DOWN"
 		statusClass := "status-bad"
 		if backend.IsAlive() {
@@ -199,34 +271,16 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, dashboardHTML, totalRequests, activeBackends, healthyBackends)
 }
 
-
-// healthCheckHandler provides health status for Kubernetes probes
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	// Check if we have healthy backends
-	healthyBackends := 0
-	for _, backend := range serverPool.backends {
-		if backend.IsAlive() {
-			healthyBackends++
-		}
-	}
-
-	if healthyBackends > 0 {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("No healthy backends"))
-	}
-}
-
-// metricsHandler provides JSON metrics for external monitoring systems
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var result []map[string]interface{}
-	for _, b := range serverPool.backends {
+	backends := serverPool.Backends()
+	result := make([]map[string]interface{}, 0, len(backends))
+	for _, b := range backends {
 		result = append(result, map[string]interface{}{
-			"url":   b.URL.String(),
-			"alive": b.IsAlive(),
-			"weight": b.GetWeight(),
+			"url":     b.URL.String(),
+			"alive":   b.IsAlive(),
+			"weight":  b.GetWeight(),
+			"region":  b.Region,
+			"latency": b.Score(),
 		})
 	}
 
@@ -238,7 +292,23 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	healthyBackends := 0
+	for _, backend := range serverPool.Backends() {
+		if backend.IsAlive() {
+			healthyBackends++
+		}
+	}
 
+	if healthyBackends > 0 {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write([]byte("No healthy backends"))
+}
 
 // main is the entry point of the load balancer application
 func main() {
@@ -249,10 +319,11 @@ func main() {
 	backendConfigs := []struct {
 		url    string
 		weight int
+		region string
 	}{
-		{"http://localhost:8081", 3}, // Higher weight - handles more traffic
-		{"http://localhost:8082", 2}, // Medium weight
-		{"http://localhost:8083", 1}, // Lower weight - handles less traffic
+		{"http://localhost:8081", 3, "us-east"}, // Higher weight - handles more traffic
+		{"http://localhost:8082", 2, "us-west"}, // Medium weight
+		{"http://localhost:8083", 1, "asia"},    // Lower weight - handles less traffic
 	}
 
 	// Start backend servers first
@@ -275,19 +346,25 @@ func main() {
 			Alive:        true,
 			ReverseProxy: proxy,
 			Weight:       config.weight,
+			Region:       config.region,
 		}
 		serverPool.AddBackend(backend)
 		log.Printf("[INFO] Added backend: %s (weight: %d)", config.url, config.weight)
+		backendConnections.WithLabelValues(backend.URL.String()).Set(0)
+		requestsTotal.WithLabelValues(backend.URL.String(), "200").Add(0)
+		requestDuration.WithLabelValues(backend.URL.String()).Observe(0)
 	}
 
 	log.Printf("[INFO] Registered %d backends", len(backendConfigs))
 
 	// Setup HTTP routes
-	http.HandleFunc("/", dashboardHandler)        // Dashboard interface
-	http.HandleFunc("/lb", lbHandler)             // Load balancing endpoint
-	http.HandleFunc("/metrics", metricsHandler)   // JSON metrics endpoint
-	http.HandleFunc("/health", healthCheckHandler) // Health check for K8s probes
-	http.Handle("/prometheus", promhttp.Handler()) // Prometheus metrics
+	rateLimiter := loadbalancer.NewRateLimiter(10, 5)
+
+	http.HandleFunc("/", dashboardHandler)                                  // Dashboard interface
+	http.Handle("/lb", rateLimiter.Middleware(http.HandlerFunc(lbHandler))) // Load balancing endpoint
+	http.HandleFunc("/metrics", metricsHandler)                             // JSON metrics endpoint
+	http.HandleFunc("/health", healthCheckHandler)                          // Health check for K8s probes
+	http.Handle("/prometheus", promhttp.HandlerFor(promRegistry, promhttp.HandlerOpts{})) // Prometheus metrics
 
 	log.Printf("[INFO] Load balancer starting on :8080")
 	log.Printf("[INFO] Available endpoints:")
@@ -296,13 +373,13 @@ func main() {
 	log.Printf("[INFO]   - Metrics: http://localhost:8080/metrics")
 	log.Printf("[INFO]   - Health: http://localhost:8080/health")
 	log.Printf("[INFO]   - Prometheus: http://localhost:8080/prometheus")
-	
+
 	// Start background services
 	go loadbalancer.HealthCheckLoop(&serverPool)
 	go loadbalancer.AutoScalerLoop(&requestCount, &serverPool)
 
 	log.Printf("[INFO] Load balancer is ready to accept connections")
-	
+
 	// Start the HTTP server with default ServeMux
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("[ERROR] Failed to start server: %v", err)

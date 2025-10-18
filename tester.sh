@@ -19,6 +19,8 @@ NC='\033[0m' # No Color
 LOAD_BALANCER_URL="http://localhost:8080"
 TEST_DURATION=30
 CONCURRENT_REQUESTS=25
+RATE_LIMIT_REQUESTS=20
+GSLB_REGIONS=("us-east:8081" "us-west:8082" "asia:8083")
 
 # Cleanup function
 cleanup() {
@@ -27,6 +29,74 @@ cleanup() {
     pkill -f "go run serverpool.go" || true
     pkill -f "curl.*localhost:8080" || true
     echo -e "${GREEN}✅ Cleanup completed${NC}"
+}
+
+# Function to test GSLB routing behaviour
+test_gslb_routing() {
+    print_test_section "Testing Global Server Load Balancing"
+
+    success=0
+    for entry in "${GSLB_REGIONS[@]}"; do
+        region=${entry%%:*}
+        port=${entry##*:}
+        echo -e "${YELLOW}🌎 Requesting region '${region}'${NC}"
+        response=$(curl -s -H "X-Client-Region: ${region}" "$LOAD_BALANCER_URL/lb" 2>/dev/null)
+        if echo "$response" | grep -q "port ${port}"; then
+            echo -e "${GREEN}✅ Region ${region} served by backend ${port}${NC}"
+            success=$((success + 1))
+        else
+            echo -e "${RED}❌ Region ${region} did not route to backend ${port}${NC}"
+        fi
+    done
+
+    if [ $success -eq ${#GSLB_REGIONS[@]} ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Function to validate adaptive metrics output
+test_adaptive_metrics() {
+    print_test_section "Testing Adaptive Metrics"
+
+    echo -e "${YELLOW}📊 Fetching metrics for latency/success signals${NC}"
+    response=$(curl -s "$LOAD_BALANCER_URL/metrics" 2>/dev/null)
+    if [ -z "$response" ]; then
+        echo -e "${RED}❌ Metrics endpoint returned empty response${NC}"
+        return 1
+    fi
+
+    if echo "$response" | jq -e 'all(.[]; has("latency") and has("region"))' >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ Metrics include latency and region fields${NC}"
+        echo -e "${BLUE}📋 Sample metrics:${NC}"
+        echo "$response" | jq '.[0:2]'
+        return 0
+    fi
+
+    echo -e "${RED}❌ Metrics missing adaptive fields${NC}"
+    return 1
+}
+
+# Function to test rate limiting behaviour
+test_rate_limiting() {
+    print_test_section "Testing Rate Limiting"
+
+    echo -e "${YELLOW}🚦 Sending ${RATE_LIMIT_REQUESTS} rapid requests to trigger limiter${NC}"
+    rate_limit_hits=0
+    for i in $(seq 1 $RATE_LIMIT_REQUESTS); do
+        status=$(curl -s -o /dev/null -w "%{http_code}" "$LOAD_BALANCER_URL/lb" 2>/dev/null)
+        if [ "$status" = "429" ]; then
+            rate_limit_hits=$((rate_limit_hits + 1))
+        fi
+    done
+
+    if [ $rate_limit_hits -gt 0 ]; then
+        echo -e "${GREEN}✅ Rate limiting enforced (${rate_limit_hits} responses)${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}❌ Rate limiting not triggered${NC}"
+    return 1
 }
 
 # Set up cleanup trap
@@ -276,6 +346,10 @@ main() {
     ((TESTS_TOTAL++))
     if test_prometheus; then ((TESTS_PASSED++)); fi
 
+    # Test 5: GSLB Routing
+    ((TESTS_TOTAL++))
+    if test_gslb_routing; then ((TESTS_PASSED++)); fi
+
     # Test 5: Load Distribution
     ((TESTS_TOTAL++))
     if test_load_distribution; then ((TESTS_PASSED++)); fi
@@ -284,7 +358,15 @@ main() {
     ((TESTS_TOTAL++))
     if test_sticky_sessions; then ((TESTS_PASSED++)); fi
 
-    # Test 7: Load Generation
+    # Test 7: Adaptive Metrics
+    ((TESTS_TOTAL++))
+    if test_adaptive_metrics; then ((TESTS_PASSED++)); fi
+
+    # Test 8: Rate Limiting
+    ((TESTS_TOTAL++))
+    if test_rate_limiting; then ((TESTS_PASSED++)); fi
+
+    # Test 9: Load Generation
     print_test_section "Load Generation Test"
     echo -e "${YELLOW}🔥 Testing with $CONCURRENT_REQUESTS concurrent requests${NC}"
     if generate_load $CONCURRENT_REQUESTS "/lb"; then
