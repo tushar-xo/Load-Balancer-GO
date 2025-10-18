@@ -60,6 +60,7 @@ coverage.html
 
 # Executable files
 /loadbalancer
+!/loadbalancer/
 /main
 /Load-Balancer-GO
 

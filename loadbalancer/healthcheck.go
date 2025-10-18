@@ -70,12 +70,9 @@ func HealthCheckLoop(serverPool ServerPoolInterface) {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
 
-	for {
-		select {
-		case <-t.C:
-			// This would need to call the appropriate health check method
-			// on the serverPool interface
-			serverPool.HealthCheck()
-		}
+	for range t.C {
+		// This would need to call the appropriate health check method
+		// on the serverPool interface
+		serverPool.HealthCheck()
 	}
 }

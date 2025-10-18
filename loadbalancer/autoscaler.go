@@ -26,11 +26,8 @@ func (as *AutoScaler) Start() {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 
-	for {
-		select {
-		case <-t.C:
-			as.checkAndScale()
-		}
+	for range t.C {
+		as.checkAndScale()
 	}
 }
 
