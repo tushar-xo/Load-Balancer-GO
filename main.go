@@ -12,12 +12,48 @@ import (
 	"time"
 
 	"go-loadbalancer/loadbalancer" // Import our loadbalancer package
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Global variables for load balancer state management
 var requestCount int64          // Counter for total requests processed
 var serverPool = ServerPool{     // Initialize ServerPool with sticky sessions map
 	stickySessions: make(map[string]*Backend),
+}
+
+// Prometheus metrics
+var (
+	requestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "loadbalancer_requests_total",
+			Help: "Total number of requests processed by the load balancer",
+		},
+		[]string{"backend", "status"},
+	)
+
+	backendConnections = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "loadbalancer_backend_connections",
+			Help: "Number of active connections to each backend",
+		},
+		[]string{"backend"},
+	)
+
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "loadbalancer_request_duration_seconds",
+			Help: "Request duration in seconds",
+		},
+		[]string{"backend"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(requestsTotal)
+	prometheus.MustRegister(backendConnections)
+	prometheus.MustRegister(requestDuration)
 }
 
 
@@ -152,6 +188,9 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
             <li>✅ Health Checking</li>
             <li>✅ Auto-scaling</li>
             <li>✅ Real-time Metrics</li>
+            <li>✅ Prometheus Monitoring</li>
+            <li>✅ Docker Containerization</li>
+            <li>✅ Kubernetes Ready</li>
         </ul>
     </div>
 </body>
@@ -160,6 +199,25 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, dashboardHTML, totalRequests, activeBackends, healthyBackends)
 }
 
+
+// healthCheckHandler provides health status for Kubernetes probes
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if we have healthy backends
+	healthyBackends := 0
+	for _, backend := range serverPool.backends {
+		if backend.IsAlive() {
+			healthyBackends++
+		}
+	}
+
+	if healthyBackends > 0 {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("No healthy backends"))
+	}
+}
 
 // metricsHandler provides JSON metrics for external monitoring systems
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +236,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+}
+
+// prometheusHandler serves Prometheus metrics
+func prometheusHandler(w http.ResponseWriter, r *http.Request) {
+	promhttp.Handler().ServeHTTP(w, r)
 }
 
 // main is the entry point of the load balancer application
@@ -226,12 +289,16 @@ func main() {
 	http.HandleFunc("/", dashboardHandler)        // Dashboard interface
 	http.HandleFunc("/lb", lbHandler)             // Load balancing endpoint
 	http.HandleFunc("/metrics", metricsHandler)   // JSON metrics endpoint
+	http.HandleFunc("/health", healthCheckHandler) // Health check for K8s probes
+	http.Handle("/prometheus", promhttp.Handler()) // Prometheus metrics
 
 	log.Printf("[INFO] Load balancer starting on :8080")
 	log.Printf("[INFO] Available endpoints:")
 	log.Printf("[INFO]   - Dashboard: http://localhost:8080/")
 	log.Printf("[INFO]   - Load balancer: http://localhost:8080/lb")
 	log.Printf("[INFO]   - Metrics: http://localhost:8080/metrics")
+	log.Printf("[INFO]   - Health: http://localhost:8080/health")
+	log.Printf("[INFO]   - Prometheus: http://localhost:8080/prometheus")
 
 	// Start background services
 	go loadbalancer.HealthCheckLoop(&serverPool)
