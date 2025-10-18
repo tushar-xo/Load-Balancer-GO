@@ -59,8 +59,9 @@ coverage.html
 *.a
 
 # Executable files
-loadbalancer
-main
+/loadbalancer
+/main
+/Load-Balancer-GO
 
 # Debug files
 debug
