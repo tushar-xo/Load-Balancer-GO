@@ -32,7 +32,7 @@ type ConsulHealthService struct {
 	Service string        `json:"Service"`
 	Checks  []HealthCheck `json:"Checks"`
 	ID      string        `json:"ID"`
-	Name    string        `json:"Service"`
+	Name    string        `json:"Name"`
 }
 
 type HealthCheck struct {
