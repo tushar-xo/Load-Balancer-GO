@@ -35,6 +35,8 @@ Thumbs.db
 
 # Log files
 *.log
+cookies.txt
+*.pid
 
 # Environment files
 .env

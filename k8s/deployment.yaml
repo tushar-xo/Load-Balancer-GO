@@ -4,6 +4,7 @@ metadata:
   name: go-loadbalancer
   labels:
     app: go-loadbalancer
+    version: v2.0
 spec:
   replicas: 3
   selector:
@@ -13,39 +14,52 @@ spec:
     metadata:
       labels:
         app: go-loadbalancer
+        version: v2.0
     spec:
       containers:
       - name: loadbalancer
-        image: docker.io/tusharxoxd/load-balancer-go:latest
+        image: docker.io/tusharxoxd/load-balancer-go:enterprise
         ports:
         - containerPort: 8080
         env:
         - name: PORT
           value: "8080"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: CIRCUIT_BREAKER_THRESHOLD
+          value: "5"
+        - name: ENABLE_TELEMETRY
+          value: "true"
         livenessProbe:
           httpGet:
             path: /health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /health
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
             memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
             cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: go-loadbalancer-service
+  labels:
+    app: go-loadbalancer
 spec:
   selector:
     app: go-loadbalancer
@@ -53,4 +67,64 @@ spec:
   - name: http
     port: 80
     targetPort: 8080
+    protocol: TCP
   type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-loadbalancer-hpa
+  labels:
+    app: go-loadbalancer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-loadbalancer
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: go-loadbalancer-metrics
+  labels:
+    app: go-loadbalancer
+spec:
+  selector:
+    matchLabels:
+      app: go-loadbalancer
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s

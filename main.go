@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,22 +10,25 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/tushar-xo/Load-Balancer-GO/loadbalancer" // Import our loadbalancer package
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Global variables for load balancer state management
-var requestCount int64       // Counter for total requests processed
-var serverPool = ServerPool{ // Initialize ServerPool with sticky sessions map
-	stickySessions: make(map[string]*Backend),
-}
+var (
+	requestCount int64       // Counter for total requests processed
+	serverPool = ServerPool{ // Initialize ServerPool with sticky sessions map
+		stickySessions: make(map[string]*Backend),
+	}
+	telemetry *loadbalancer.SimpleTelemetryProvider // Simple telemetry provider for observability
+)
 
 func getClientRegion(r *http.Request) string {
 	if region := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Client-Region"))); region != "" {
@@ -129,27 +134,38 @@ func lbHandler(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, cookie)
 	}
 
-	// Get backend based on sticky session or load balancing algorithm
+	// Get backend based on traffic policies, sticky session, or load balancing algorithm
 	var peer *Backend
 	region := getClientRegion(r)
+	
+	// Check if traffic policies are enabled and use them
 	if sessionID != "" {
 		peer = serverPool.GetBackendForStickySession(sessionID, region)
 	} else {
-		// Use weighted routing for new sessions
-		peer = serverPool.SelectBackend(region)
+		// Use traffic policies first, fall back to normal selection
+		peer = serverPool.SelectBackendWithPolicy(r)
 		if peer == nil {
-			peer = serverPool.GetNextPeerWeighted()
+			peer = serverPool.SelectBackend(region)
 		}
+	}
+	
+	// Finally fallback to weighted routing if still no backend
+	if peer == nil {
+		peer = serverPool.GetNextPeerWeighted()
 	}
 
 	if peer == nil {
-		log.Printf("[ERROR] No healthy backends available")
+		telemetry.LogError("No healthy backends available", fmt.Errorf("service unavailable"))
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Log the routing decision
-	log.Printf("[INFO] Routing request to backend: %s (session: %s)", peer.URL.String(), sessionID)
+	// Log the routing decision with structured logging
+	telemetry.LogInfo("Routing request to backend",
+		"backend", peer.URL.String(),
+		"session", sessionID,
+		"circuit_breaker_state", fmt.Sprintf("%v", peer.GetCircuitBreakerState()),
+	)
 
 	peer.IncrementActive()
 	defer func() {
@@ -159,16 +175,48 @@ func lbHandler(w http.ResponseWriter, r *http.Request) {
 
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	start := time.Now()
-	peer.ReverseProxy.ServeHTTP(recorder, r)
+
+	// Execute request through circuit breaker
+	_, err := peer.ExecuteRequest(func() (interface{}, error) {
+		// Create a response recorder to capture the response
+		peer.ReverseProxy.ServeHTTP(recorder, r)
+		return nil, nil
+	})
+
 	duration := time.Since(start)
 	statusCode := recorder.status
 	if statusCode == 0 {
 		statusCode = http.StatusBadGateway
 	}
-	success := statusCode < 500
+	success := statusCode < 500 && err == nil
+
+	// Record metrics
+	telemetry.RecordRequestMetrics(context.Background(), peer.URL.String(), r.Method, strconv.Itoa(statusCode), duration)
 	peer.RecordMetrics(duration, success)
+	
+	// Update legacy Prometheus metrics
 	requestsTotal.WithLabelValues(peer.URL.String(), strconv.Itoa(statusCode)).Inc()
 	requestDuration.WithLabelValues(peer.URL.String()).Observe(duration.Seconds())
+
+	// Handle circuit breaker failures
+	if err != nil {
+		telemetry.LogWarn("Circuit breaker triggered",
+			"backend", peer.URL.String(),
+			"error", err,
+		)
+		
+		if errors.Is(err, loadbalancer.ErrTooManyRequests) {
+			http.Error(w, "Service temporarily unavailable (circuit breaker open)", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	telemetry.LogDebug("Request completed successfully",
+		"backend", peer.URL.String(),
+		"duration", duration,
+	)
 }
 
 // dashboardHandler serves a web dashboard showing load balancer status and metrics
@@ -193,6 +241,10 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         .status-good { color: #28a745; }
         .status-bad { color: #dc3545; }
         .weight { background: #e9ecef; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+        .circuit-breaker { background: #f8f9fa; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+        .cb-closed { color: #28a745; }
+        .cb-open { color: #dc3545; }
+        .cb-half-open { color: #ffc107; }
     </style>
 </head>
 <body>
@@ -240,12 +292,29 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			statusClass = "status-good"
 		}
 
+		// Get circuit breaker status
+		cbState := backend.GetCircuitBreakerState()
+		cbStateText := ""
+		cbStateClass := ""
+		switch cbState {
+		case loadbalancer.StateClosed:
+			cbStateText = "CLOSED"
+			cbStateClass = "cb-closed"
+		case loadbalancer.StateOpen:
+			cbStateText = "OPEN"
+			cbStateClass = "cb-open"
+		case loadbalancer.StateHalfOpen:
+			cbStateText = "HALF-OPEN"
+			cbStateClass = "cb-half-open"
+		}
+
 		dashboardHTML += fmt.Sprintf(`
             <div class="backend-card">
                 <div class="backend-url">%s</div>
                 <div class="%s">Status: %s</div>
                 <div class="weight">Weight: %d</div>
-            </div>`, backend.URL.String(), statusClass, status, backend.GetWeight())
+                <div class="circuit-breaker %s">CB: %s</div>
+            </div>`, backend.URL.String(), statusClass, status, backend.GetWeight(), cbStateClass, cbStateText)
 	}
 
 	dashboardHTML += `
@@ -258,6 +327,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
             <li>✅ Weighted Load Balancing</li>
             <li>✅ Sticky Sessions</li>
             <li>✅ Health Checking</li>
+            <li>✅ Circuit Breakers</li>
             <li>✅ Auto-scaling</li>
             <li>✅ Real-time Metrics</li>
             <li>✅ Prometheus Monitoring</li>
@@ -340,19 +410,142 @@ func main() {
 			log.Fatalf("[ERROR] Failed to parse backend URL %s: %v", config.url, err)
 		}
 
-		proxy := httputil.NewSingleHostReverseProxy(u)
-		backend := &Backend{
-			URL:          u,
-			Alive:        true,
-			ReverseProxy: proxy,
-			Weight:       config.weight,
-			Region:       config.region,
+        proxy := httputil.NewSingleHostReverseProxy(u)
+        if tr, err := loadbalancer.NewMTLSTransportFromEnv(); err != nil {
+            log.Printf("[ERROR] mTLS transport setup failed: %v", err)
+        } else if tr != nil {
+            proxy.Transport = tr
+            log.Printf("[INFO] mTLS enabled for backend %s", config.url)
+        }
+		
+		// Initialize circuit breaker for each backend
+		circuitBreaker := loadbalancer.NewCircuitBreaker(
+			fmt.Sprintf("backend-%s", strings.TrimPrefix(config.url, "http://localhost:")),
+			loadbalancer.WithMaxRequests(3),
+			loadbalancer.WithInterval(10*time.Second),
+			loadbalancer.WithTimeout(30*time.Second),
+			loadbalancer.WithReadyToTrip(func(counts loadbalancer.Counts) bool {
+				// Trip circuit breaker after 5 consecutive failures
+				return counts.ConsecutiveFailures >= 5
+			}),
+			loadbalancer.WithOnStateChange(func(name string, from, to loadbalancer.CircuitBreakerState) {
+				log.Printf("[INFO] Circuit breaker '%s' changed from %v to %v", name, from, to)
+			}),
+		)
+		
+        backend := &Backend{
+			URL:            u,
+			Alive:          true,
+			ReverseProxy:   proxy,
+			Weight:         config.weight,
+			Region:         config.region,
+			CircuitBreaker: circuitBreaker,
 		}
 		serverPool.AddBackend(backend)
 		log.Printf("[INFO] Added backend: %s (weight: %d)", config.url, config.weight)
 		backendConnections.WithLabelValues(backend.URL.String()).Set(0)
 		requestsTotal.WithLabelValues(backend.URL.String(), "200").Add(0)
 		requestDuration.WithLabelValues(backend.URL.String()).Observe(0)
+	}
+
+	// Enable Redis support with mock client for demonstration
+	redisClient := loadbalancer.NewMockRedisClient()
+	serverPool.EnableRedisSupport(redisClient, "loadbalancer", time.Hour)
+	log.Printf("[INFO] Redis support enabled for distributed sticky sessions")
+	
+	// Enable Consul service discovery (can be toggled with environment variable)
+	consulEnabled := os.Getenv("CONSUL_ENABLED") == "true"
+	if consulEnabled {
+		consulClient := loadbalancer.NewMockConsulClient()
+		consulManager := loadbalancer.NewConsulServiceManager(consulClient, "web-app")
+		serverPool.EnableConsulSupport(consulManager)
+		
+		// Add initial Consul-discovered backends
+		serverPool.UpdateBackendsFromConsul()
+		log.Printf("[INFO] Consul service discovery enabled")
+	} else {
+		log.Printf("[INFO] Using static backend configuration (set CONSUL_ENABLED=true for service discovery)")
+	}
+
+	// Initialize Simple Telemetry for observability
+	telemetry = loadbalancer.NewSimpleTelemetryProvider("go-loadbalancer")
+	log.Printf("[INFO] Simple telemetry provider enabled")
+	
+	// Enable traffic policies (can be toggled with environment variable)
+	trafficPoliciesEnabled := os.Getenv("TRAFFIC_POLICIES_ENABLED") == "true"
+	if trafficPoliciesEnabled {
+		policies := []loadbalancer.TrafficPolicy{
+			{
+				Name:     "Geo-Based Routing",
+				Type:     loadbalancer.PolicyTypeGeo,
+				Enabled:  true,
+				Priority: 100,
+				Rules: []loadbalancer.PolicyRule{
+					{
+						Field:    "region",
+						Operator: "equals",
+						Value:   "us-east",
+						Action:  "allow",
+						Weight:   10,
+					},
+					{
+						Field:    "region", 
+						Operator: "equals",
+						Value:   "asia",
+						Action:  "redirect",
+						Backend: "http://localhost:8083",
+						Weight:   5,
+					},
+				},
+			},
+			{
+				Name:     "Header-Based API Routing",
+				Type:     loadbalancer.PolicyTypeHeader,
+				Enabled:  true,
+				Priority: 90,
+				Rules: []loadbalancer.PolicyRule{
+					{
+						Field:    "X-API-Version",
+						Operator: "equals",
+						Value:   "v2",
+						Action:  "allow",
+						Weight:   8,
+					},
+					{
+						Field:    "X-Client-Type",
+						Operator: "contains",
+						Value:   "premium",
+						Action:  "redirect",
+						Backend: "http://localhost:8081",
+						Weight:   15,
+					},
+				},
+			},
+			{
+				Name:     "Canary Deployment",
+				Type:     loadbalancer.PolicyTypeCanary,
+				Enabled:  true,
+				Priority: 80,
+				Weight:   20,
+				Conditions: loadbalancer.PolicyConditions{
+					PercentageTraffic: 30, // 30% of traffic to canary
+				},
+				Rules: []loadbalancer.PolicyRule{
+					{
+						Field:    "path",
+						Operator: "prefix",
+						Value:   "/api/v2",
+						Action:  "allow",
+						Weight:   10,
+					},
+				},
+			},
+		}
+		
+		serverPool.EnableTrafficPolicies(policies)
+		log.Printf("[INFO] Traffic policies engine enabled with %d policies", len(policies))
+	} else {
+		log.Printf("[INFO] Using standard load balancing (set TRAFFIC_POLICIES_ENABLED=true for policies)")
 	}
 
 	log.Printf("[INFO] Registered %d backends", len(backendConfigs))
