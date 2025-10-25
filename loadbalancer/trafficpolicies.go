@@ -313,20 +313,6 @@ func (tpe *TrafficPolicyEngine) getClientIP(r *http.Request) string {
     return r.RemoteAddr
 }
 
-// selectWeightedBackend selects a backend using weights
-func (tpe *TrafficPolicyEngine) selectWeightedBackend(r *http.Request, maxWeight int) interface{} {
-    // Selection delegated to caller; return nil to signal fallback
-    return nil
-}
-
-// selectHealthyBackend selects any healthy backend
-func (tpe *TrafficPolicyEngine) selectHealthyBackend(r *http.Request) interface{} {
-    // Return any backend if needed; currently selection is delegated to caller
-    for _, backend := range tpe.backendMap {
-        return backend
-    }
-    return nil
-}
 
 // GetPolicies returns all configured policies
 func (tpe *TrafficPolicyEngine) GetPolicies() []TrafficPolicy {

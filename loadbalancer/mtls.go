@@ -4,7 +4,6 @@ import (
     "crypto/tls"
     "crypto/x509"
     "fmt"
-    "io/ioutil"
     "net/http"
     "os"
     "strconv"
@@ -35,7 +34,7 @@ func NewMTLSTransportFromEnv() (*http.Transport, error) {
     // Load CA cert pool if provided
     var rootCAs *x509.CertPool
     if caFile != "" {
-        caCert, err := ioutil.ReadFile(caFile)
+        caCert, err := os.ReadFile(caFile)
         if err != nil {
             return nil, fmt.Errorf("failed to read CA file: %w", err)
         }
